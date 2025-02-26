@@ -6,7 +6,7 @@
 #include <din32-numsonly.h>
 #include <din64-numsonly.h>
 #include <Adafruit_MAX31865.h>
-#include <AutoPID.h>
+#include <QuickPID.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 
@@ -22,10 +22,9 @@
 #define HEATER_PIN 39
 
 //pid initial settings and gains
-#define PULSE_WIDTH 200
-#define KP .12
-#define KI .0003
-#define KD 0
+const unsigned long windowSize = 2000;
+const byte debounce = 50;
+float pidOut, Kp = 2, Ki = 5, Kd = 1;
 
 // Wifi
 const char *wifiSsd = "Nekotronik";
@@ -38,15 +37,17 @@ const char *wifiPass = "ireallylovecarpets";
 Adafruit_SH1107 display = Adafruit_SH1107(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET, 1000000, 100000);
 Adafruit_MAX31865 thermo = Adafruit_MAX31865(THERMO_CS_PIN);
 
-double temperature, setPoint;
+float temperature = 103, setPoint = 103;
 bool heaterState;
+unsigned long windowStartTime, nextSwitchTime;
 
-AutoPIDRelay tempPid(&temperature, &setPoint, &heaterState, PULSE_WIDTH, KP, KI, KD);
+QuickPID tempPID(&temperature, &pidOut, &setPoint, Kp, Ki, Kd,
+                 tempPID.pMode::pOnError,
+                 tempPID.dMode::dOnMeas,
+                 tempPID.iAwMode::iAwClamp,
+                 tempPID.Action::direct);
+
 AsyncWebServer server(80);
-
-double currKp = KP;
-double currKi = KI;
-double currKd = KD;
 
 void setup() {
   // set up heater
@@ -58,8 +59,9 @@ void setup() {
   updateTemperature();
 
   // set up PID
-  tempPid.setBangBang(5);
-  tempPid.setTimeStep(50);
+  tempPID.SetOutputLimits(0, windowSize);
+  tempPID.SetSampleTimeUs(windowSize * 1000);
+  tempPID.SetMode(tempPID.Control::automatic);
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSsd, wifiPass);
@@ -79,8 +81,27 @@ void setup() {
 void loop() {
   // put your main code here, to run repeatedly:
   updateTemperature();
-  tempPid.run();
+  runPidUpdate();
   digitalWrite(HEATER_PIN, heaterState);
+}
+
+void runPidUpdate() {
+  unsigned long msNow = millis();
+  if (tempPID.Compute()) windowStartTime = msNow;
+
+  if (!heaterState && pidOut > (msNow - windowStartTime)) {
+    if (msNow > nextSwitchTime) {
+      nextSwitchTime = msNow + debounce;
+      heaterState = true;
+      digitalWrite(HEATER_PIN, HIGH);
+    }
+  } else if (heaterState && pidOut < (msNow - windowStartTime)) {
+    if (msNow > nextSwitchTime) {
+      nextSwitchTime = msNow + debounce;
+      heaterState = false;
+      digitalWrite(HEATER_PIN, LOW);
+    }
+  }
 }
 
 void updateTemperature() {
@@ -100,20 +121,21 @@ String getTempValuesJson() {
 }
 
 String getPidValuesJson() {
-  return "{\"kp\":" + String(currKp, 6) + ",\"ki\":" + String(currKi, 6) + ",\"kd\":" + String(currKd, 6) + "}";
+  return "{\"kp\":" + String(Kp, 6) + ",\"ki\":" + String(Ki, 6) + ",\"kd\":" + String(Kd, 6) + "}";
 }
 
 void updatePidValues(double kp, double ki, double kd) {
-  currKp = kp;
-  currKi = ki;
-  currKd = kd;
-  tempPid.setGains(kp, ki, kd);
+  Kp = kp;
+  Ki = ki;
+  Kd = kd;
+  tempPID.SetTunings(kp, ki, kd);
 }
 
 void setUpWebserver() {
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "*");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "*");
+
   server.onNotFound([](AsyncWebServerRequest *request) {
     if (request->method() == HTTP_OPTIONS) {
       request->send(200);
@@ -155,7 +177,7 @@ void setUpWebserver() {
       String valStr = String((char *)data);
       double newVal = valStr.toDouble();
 
-      updatePidValues(newVal, currKi, currKd);
+      updatePidValues(newVal, Ki, Kd);
 
       request->send(200, "application/json", getPidValuesJson());
     });
@@ -168,7 +190,7 @@ void setUpWebserver() {
       String valStr = String((char *)data);
       double newVal = valStr.toDouble();
 
-      updatePidValues(currKp, newVal, currKd);
+      updatePidValues(Kp, newVal, Kd);
 
       request->send(200, "application/json", getPidValuesJson());
     });
@@ -181,7 +203,7 @@ void setUpWebserver() {
       String valStr = String((char *)data);
       double newVal = valStr.toDouble();
 
-      updatePidValues(currKp, currKi, newVal);
+      updatePidValues(Kp, Ki, newVal);
 
       request->send(200, "application/json", getPidValuesJson());
     });
