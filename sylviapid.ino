@@ -3,14 +3,17 @@
 #include <WiFi.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
-#include <din32-numsonly.h>
-#include <din64-numsonly.h>
+#include "din32-numsonly.h"
+#include "din16-numsonly.h"
 #include <Adafruit_MAX31865.h>
 #include <QuickPID.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <Adafruit_seesaw.h>
+#include <seesaw_neopixel.h>
+#include <cmath>
 
-#define THERMO_CS_PIN 34
+#define THERMO_CS_PIN 13
 #define THERMO_RREF 430.0
 #define THERMO_RNOMINAL 100.0
 
@@ -18,6 +21,15 @@
 #define SCREEN_HEIGHT 128
 #define OLED_RESET -1
 #define SCREEN_ADDR 0x3D
+
+#define SS_SWITCH 24
+#define SS_NEOPIX 6
+
+#define SEESAW_ADDR 0x36
+
+Adafruit_seesaw ss;
+seesaw_NeoPixel sspixel = seesaw_NeoPixel(1, SS_NEOPIX, NEO_GRB + NEO_KHZ800);
+int32_t encoder_position;
 
 #define HEATER_PIN 39
 
@@ -37,9 +49,12 @@ const char *wifiPass = "ireallylovecarpets";
 Adafruit_SH1107 display = Adafruit_SH1107(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET, 1000000, 100000);
 Adafruit_MAX31865 thermo = Adafruit_MAX31865(THERMO_CS_PIN);
 
-float temperature = 103, setPoint = 103;
+int humanSetPoint = 218;
+
+float temperature = 103, setPoint;
 bool heaterState;
 unsigned long windowStartTime, nextSwitchTime;
+int tempOnScreen, setPointOnScreen;
 
 QuickPID tempPID(&temperature, &pidOut, &setPoint, Kp, Ki, Kd,
                  tempPID.pMode::pOnError,
@@ -49,7 +64,13 @@ QuickPID tempPID(&temperature, &pidOut, &setPoint, Kp, Ki, Kd,
 
 AsyncWebServer server(80);
 
+int led = LED_BUILTIN;
+
 void setup() {
+  Serial.begin(115200);
+  pinMode(led, OUTPUT);
+  digitalWrite(led, HIGH);
+  setPoint = fToC(static_cast<float>(humanSetPoint));
   // set up heater
   pinMode(HEATER_PIN, OUTPUT);
   digitalWrite(HEATER_PIN, LOW);
@@ -63,11 +84,28 @@ void setup() {
   tempPID.SetSampleTimeUs(windowSize * 1000);
   tempPID.SetMode(tempPID.Control::automatic);
 
+  // set up rotary encoder
+  if (!ss.begin(SEESAW_ADDR) || !sspixel.begin(SEESAW_ADDR)) {
+    Serial.println("Couldn't find seesaw on default address");
+    while (1) delay(10);
+  }
+
+  ss.pinMode(SS_SWITCH, INPUT_PULLUP);
+  encoder_position = ss.getEncoderPosition();
+  ss.setGPIOInterrupts((uint32_t)1 << SS_SWITCH, 1);
+  ss.enableEncoderInterrupt();
+  sspixel.setBrightness(10);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSsd, wifiPass);
 
   delay(250);  // wait for OLED to power up
   display.begin(SCREEN_ADDR, true);
+
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.println("Connecting");
+  display.display();
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -79,9 +117,11 @@ void setup() {
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
   updateTemperature();
+  updateEncoder();
   runPidUpdate();
+  updateEncoderPixel();
+  updateScreen();
   digitalWrite(HEATER_PIN, heaterState);
 }
 
@@ -108,6 +148,25 @@ void updateTemperature() {
   temperature = thermo.temperature(THERMO_RNOMINAL, THERMO_RREF);
 }
 
+void updateEncoder() {
+  int32_t new_position = ss.getEncoderPosition();
+  if (new_position != encoder_position) {
+    int32_t diff = new_position - encoder_position;
+    humanSetPoint += diff;
+    setPoint = fToC(static_cast<float>(humanSetPoint));
+    encoder_position = new_position;
+  }
+}
+
+void updateEncoderPixel() {
+  if (heaterState) {
+    sspixel.setPixelColor(0, sspixel.Color(255, 36, 8));
+  } else {
+    sspixel.setPixelColor(0, sspixel.Color(0, 0, 0));
+  }
+  sspixel.show();
+}
+
 double cToF(double degC) {
   return (degC * 9.0 / 5.0) + 32.0;
 }
@@ -117,7 +176,12 @@ double fToC(double degF) {
 }
 
 String getTempValuesJson() {
-  return "{\"curr\":" + String(temperature, 6) + ",\"set\":" + String(setPoint, 6) + "}";
+  uint16_t rtd = thermo.readRTD();
+  float ratio = rtd;
+  ratio /= 32768;
+  float resistance = THERMO_RREF * ratio;
+  uint8_t fault = thermo.readFault();
+  return "{\"curr\":" + String(temperature, 6) + ",\"set\":" + String(setPoint, 6) + ",\"rtd\":" + String(rtd, 6) + ",\"resistance\":" + String(resistance, 6) + ",\"fault\":\"" + String(fault, HEX) + "\"}";
 }
 
 String getPidValuesJson() {
@@ -129,6 +193,36 @@ void updatePidValues(double kp, double ki, double kd) {
   Ki = ki;
   Kd = kd;
   tempPID.SetTunings(kp, ki, kd);
+}
+
+void updateScreen() {
+  int currTemp = static_cast<int>(std::round(cToF(temperature)));
+  if (tempOnScreen != currTemp || setPointOnScreen != humanSetPoint) {
+    drawScreen(currTemp, humanSetPoint);
+    tempOnScreen = currTemp;
+    setPointOnScreen = humanSetPoint;
+  }
+}
+
+void drawScreen(int currTemp, int currSetPoint) {
+  int16_t x1, y1;
+  uint16_t w, h;
+
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setFont(&DIN_Alternate_Bold32pt7b);
+  String currTempStr = String(currTemp);
+  display.getTextBounds(currTempStr, 0, 64, &x1, &y1, &w, &h);
+  int xOffset = (SCREEN_WIDTH - w) / 2;
+  display.setCursor(xOffset, 74);
+  display.print(currTempStr);
+  display.setFont(&DIN_Alternate_Bold16pt7b);
+  String currSetPointStr = String(currSetPoint);
+  display.getTextBounds(currSetPointStr, 0, 128, &x1, &y1, &w, &h);
+  xOffset = (SCREEN_WIDTH - w) / 2;
+  display.setCursor(xOffset, 120);
+  display.print(currSetPointStr);
+  display.display();
 }
 
 void setUpWebserver() {
